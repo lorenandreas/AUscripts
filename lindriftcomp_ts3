@@ -1,0 +1,1335 @@
+/****************************************************************/
+/*      lindriftcomp   topspin3 version 30.01.2019              */
+/****************************************************************/
+/*      Short Description :                                     */
+/*      linear drift compenstaion using C binary file handling  */
+/*      fopen, fread for file handling;  for 2D, 3D, 4D         */
+/*      spectra using planes, points or NUS acquisition         */
+/*      (NUS available only for 3D and 4D spectra)              */
+/****************************************************************/
+/*      Description/Usage :                                     */
+/*      The AU program applies a linear phase ramp in both      */
+/*      direct and indirect dimensions to correct for any       */
+/*      occuring drift, assuming the drift is linear.           */
+/*      Save the program (depending on your Topspin version)    */ 
+/*      to Bruker/Topspin_*version*_/exp/stan/nmr/au/src/user   */
+/*      The script can be started by typing the name of the     */
+/*      script at the command line. Tested in Topspin 3.5pl6    */
+/*      The start shift value is applied to the first FID,      */
+/*      and the end shift is applied to the last acquired FID.  */ 
+/*      The shift for intermediate FIDs is determined by linear */
+/*      interpolation.                                          */
+/*      Start and end shift values are each derived from 1D     */
+/*      spectra measured at the start and end of the nD         */
+/*      experiment.(E.g. this could be the distance of the      */
+/*      water peak of the current spectrum from that of the     */
+/*      reference.) Enter values in units of Hz for the         */
+/*      detected nucleus.                                       */
+/*      A positive shift will shift the spectrum to the left.   */
+/*      The AU program does not overwrite the current dataset,  */
+/*      but generates a new dataset, whose number should be     */
+/*      entered by the user.                                    */
+/****************************************************************/
+/*      Author(s) :                                             */
+/*      Name            : Eszter E. Najbauer                    */
+/*      Organisation    : Max Planck Institute for              */
+/*                        Biophysical Chemistry                 */
+/*      Email           : esna@nmr.mpibpc.mpg.de                */
+/*                                                              */
+/*      Name            : Loren B. Andreas                      */
+/*      Organisation    : Max Planck Institute for              */
+/*                        Biophysical Chemistry                 */
+/*      Email           : land@nmr.mpibpc.mpg.de                */
+/*      We thank Wolgang Bermel for his technical assistance.   */
+/*      Citation: Najbauer and Andreas: JMR 2019                */
+/****************************************************************/
+
+/******PROGRAM OUTLINE:
+    READ IN PARAMETERS
+    SHIFT DATA
+        PLANES  
+            2D  (including Echo-Antiecho module)
+            3D  
+                312 aqseq
+                321 aqseq
+            4D  4321 aqseq
+        NUS
+            3D
+                312 aqseq
+                321 aqseq
+        POINTS
+            3D  
+                321 aqseq
+                312 aqseq
+            4D  4321 aqseq  ******/
+
+char infile[PATH_MAX], outfile[PATH_MAX];
+char path[PATH_MAX + 64], modetext[80], autext[256];
+double g_delay, ymin, ymax, bf1, bf2, bf3, bf_dir;
+double dur = 0;
+double dur2= 0;
+double dur3= 0;
+double dur4= 0;
+float dw, start_c, end_c, in_f1, in_f2, in_f3;
+int *row1;
+int *rowo;
+int td, td1, td2, td3, tds, td1s, td2s, td3s, tot_points;
+int i, j, k, l;
+int oexpno, nexpno, byteorder, parmode, dspfvs, dtypa, aqmod;
+int fntype = 0;
+int fnmode1s, fnmode2s, fnmode3s;
+int aqseq  = -1;
+int arglim = 3;
+int nus_points;
+int cur_pointf1, cur_pointf2, cur_pointf3;
+char datapath1[1024];  /*for nuslist*/
+char* hashbuf;
+const char* modepnt;
+FILE *fpin, *fpout;
+FILE *fp;
+
+static const int decim_tab[] = {2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128,
+                192, 256, 384, 512, 768, 1024, 1536, 2048};
+
+static const int delay_tab_10[] = {179, 201, 533, 709, 1097, 1449, 2225, 2929, 4481,
+                    5889, 8993, 11809, 18017, 23649, 36065, 47329, 72161,
+                    94689, 144353, 189409, 288737};
+
+static const int delay_tab_12[] = {184, 219, 384, 602, 852, 1668, 2292, 3368, 4616, 6768,
+                    9264, 13568, 18560, 27392, 36992, 55040, 73856, 110336,
+                    147584, 220928, 295040};
+
+
+/***** get dataset and parameters *****/
+
+FETCHPARS("PARMODE", &parmode)
+
+if (parmode != 1  &&  parmode != 2 && parmode !=3)
+    STOPMSG("Program is only suitable for 2D or 3D or 4D data")
+
+FETCHPARS("BF1", &bf_dir)
+FETCHPARS("DTYPA", &dtypa)
+
+if (dtypa)
+    STOPMSG("Program is only suitable for DTYPA 0 data")
+
+FETCHPARS("AQ_mod", &aqmod)
+
+if (aqmod < 0  ||  aqmod > 3)
+    STOPMSG("acquisition status parameter AQ_mod out of range")
+
+FETCHPARS("BYTORDA", &byteorder)
+FETCHPARS("TD", &tds)
+
+td = ((tds + 255) / 256) * 256;
+
+if (td <= 0  ||  td > 64 * 1024 * 1024)
+    STOPMSG("TD{F2} direct dim")
+
+if (parmode == 1) {  /*get parameters for 2D data*/
+    FETCHPAR1("TD", &td1)
+    FETCHPAR1S("TD", &td1s)
+
+    if (td1s <= 0  ||  td1s > 64 * 1024 * 1024)
+        STOPMSG("TD{F1} out of range")
+
+    td2 = td2s = 1;
+
+    FETCHPARNS(1, "IN_F", &in_f1)
+    in_f1 = in_f1 * (1.0f / 1000000.0f);
+    FETCHPARNS(1, "BF1", &bf1)
+    
+    FETCHPARNS(1, "FnMODE", &fnmode1s)
+} else if (parmode == 2) {  /*get parameters for 3D data*/
+    FETCHPARN(1,"TD", &td1)
+    FETCHPARNS(1,"TD", &td1s)
+
+    FETCHPARN(2,"TD", &td2)
+    FETCHPARNS(2,"TD", &td2s)
+
+    if (td1s <= 0  ||  td1s > 64 * 1024 * 1024)
+        STOPMSG("TD (td1s) out of range")
+
+    if (td2s <= 0  ||  td2s > 64 * 1024 * 1024) 
+        STOPMSG("TD (td2s) out of range")
+
+    FETCHPARNS(1, "IN_F", &in_f1)
+    in_f1 = in_f1 * (1.0f / 1000000.0f);
+    FETCHPARNS(1, "BF1", &bf1)
+
+
+    FETCHPARNS(2, "IN_F", &in_f2)
+    in_f2 = in_f2 * (1.0f / 1000000.0f);
+    FETCHPARNS(2, "BF1", &bf2)
+
+    FETCHPARS("AQSEQ", &aqseq)  /*aqseq of 0 is 321, aqseq of 1 is 312, only required for 3D data, 4D aqseq is always 4321*/
+    
+    if (aqseq != 0  &&  aqseq != 1)  
+        STOPMSG("AQSEQ out of range")
+    
+    FETCHPARNS(1, "FnMODE", &fnmode1s)
+    FETCHPARNS(2, "FnMODE", &fnmode2s)
+
+    if (fnmode1s == 6  ||  fnmode2s == 6)
+        STOPMSG("Program does not handle 3D Echo-Antiecho data. For Echo-Antiecho template, see 2D section of script.")
+          
+} else if (parmode == 3) { /*get parameters for 4D data*/
+    FETCHPARN(1,"TD", &td1)
+    FETCHPARNS(1,"TD", &td1s)
+
+    FETCHPARN(2,"TD", &td2)
+    FETCHPARNS(2,"TD", &td2s)
+
+    FETCHPARN(3,"TD", &td3)
+    FETCHPARNS(3,"TD", &td3s)
+
+    if (td1s <= 0  ||  td1s > 64 * 1024 * 1024)
+        STOPMSG("TD (td1s) out of range")
+
+    if (td2s <= 0  ||  td2s > 64 * 1024 * 1024)
+        STOPMSG("TD (td2s) out of range")
+
+    if (td3s <= 0  ||  td3s > 64 * 1024 * 1024)
+        STOPMSG("TD{F1} out of range")
+
+    FETCHPARNS(1, "IN_F", &in_f1)
+    in_f1 = in_f1 * (1.0f / 1000000.0f);
+    FETCHPARNS(1, "BF1", &bf1)
+
+    FETCHPARNS(2, "IN_F", &in_f2)
+    in_f2 = in_f2 * (1.0f / 1000000.0f);
+    FETCHPARNS(2, "BF1", &bf2)
+
+    FETCHPARNS(3, "IN_F", &in_f3)
+    in_f3 = in_f3 * (1.0f / 1000000.0f);
+    FETCHPARNS(3, "BF1", &bf3)
+    
+    FETCHPARNS(1, "FnMODE", &fnmode1s)
+    FETCHPARNS(2, "FnMODE", &fnmode2s)
+    FETCHPARNS(3, "FnMODE", &fnmode3s)
+    if (fnmode1s == 6  ||  fnmode2s == 6 ||  fnmode3s == 6)
+        STOPMSG("Program does not handle 4D Echo-Antiecho data. For Echo-Antiecho template, see 2D section of script.")
+}
+
+FETCHPARS("FnTYPE", &fntype) /*planes: 0, points: 1, NUS: 2 */
+
+if (fntype < 0  ||  fntype > 2)
+    STOPMSG("FnTYPE out of range")
+
+FETCHPARS("NusPOINTS", &nus_points)   /*number of points for NUS sampled data*/
+
+FETCHPARS("DW", &dw)
+dw = dw * (2.0f / 1000000.0f);
+
+FETCHPARS("DSPFVS", &dspfvs)  /*firmware version*/
+
+if (dspfvs == 10 || dspfvs == 12) {
+    int  d_index;
+    double decim = 0;
+    const int* delay_tab = (dspfvs == 10) ? delay_tab_10 : delay_tab_12;
+
+    FETCHPARS("DECIM", &decim)
+
+    for (d_index = sizeof(decim_tab) / sizeof(decim_tab[0]) - 1; d_index >= 0 ; d_index--)
+        if (decim_tab[d_index] == decim)
+            break;
+
+    if (d_index < 0)
+        STOPMSG("DECIM out of range")
+
+    g_delay = (double)delay_tab[d_index] / decim;
+} else if (dspfvs >= 20  &&  dspfvs <= 23) {
+    double grpdly = 0;
+
+    FETCHPARS("GRPDLY", &grpdly)
+    g_delay = grpdly * 2.0;
+} else
+    STOPMSG("DSPFVS out of range")
+
+
+/***** get input *****/
+
+GETFLOAT("Enter the start shift in Hz (positive values shift left):", start_c);
+GETFLOAT("Enter the end shift in Hz:", end_c);
+GETINT("Please enter the new experiment number:", nexpno);
+
+/*** read in NUS file***/
+if ( fntype==2 ) {
+    (void)sprintf(datapath1,ACQUPATH("nuslist"));
+    fp= fopen(datapath1,"r");
+    
+    if (fp == 0) { /*file cannot be read*/
+        (void)sprintf(path, "%s:\n%s", "cannot open file for reading", infile);
+        STOPMSG(path)
+    }
+}
+
+/***** check files *****/
+
+WRAPARAM(nexpno)
+ERRORABORT
+
+(void)strcpy(infile, ACQUPATH("ser"));
+fpin = fopen(infile, "rb");
+if (fpin == 0) {
+    (void)sprintf(path, "%s:\n%s", "cannot open file for reading", infile);
+    STOPMSG(path)
+}
+
+oexpno = expno;
+expno = nexpno;
+(void)strcpy(outfile, ACQUPATH("ser"));
+expno = oexpno;
+fpout = fopen(outfile, "wb");
+if (fpout == 0) {
+    (void)sprintf(path, "%s:\n%s", "cannot open file for writing", outfile);
+    STOPMSG(path)
+}
+
+/*****SHIFT CORRECTION*****/ 
+
+if (fntype == 0) {  /****PLANES ACQUISITION MODE****/
+    if (parmode == 1 ) {  /***2D data***/
+        tot_points = td1s / 2;
+
+        row1 = (int*)malloc(td * td1s * sizeof(int));
+        rowo = (int*)malloc(td * td1s * sizeof(int));
+        fread(row1, sizeof(int), td * td1s, fpin);
+
+        for (i = 0; i < td1s / 2; i++) {  /*indirect dim loop*/
+            for (j = 0; j < td; j += 2) {  /*direct dim loop*/
+                int rr, ri, ir, ii;
+                double arg1, c1, s1, arg2, c2, s2,crr,cri,cir,cii;
+                
+                if (fnmode1s < 6) { /* not Echo-Antiecho*/
+                    rr = row1[2*i*td+j];
+                    ri = row1[2*i*td+j+1];
+                    ir = row1[(2*i+1)*td+j];
+                    ii = row1[(2*i+1)*td+j+1];
+                }
+                
+                else if (fnmode1s == 6) {  /*Echo-Antiecho*/
+                    ri = (row1[2*i*td+j] + row1[(2*i+1)*td+j] ) / 2;  /* rr and ri swapped and ri is inverted relative to other components to apply 90 deg phase shift*/
+                    rr = -(row1[2*i*td+j+1] + row1[(2*i+1)*td+j+1] ) / 2; 
+                    ir = -(row1[2*i*td+j] - row1[(2*i+1)*td+j] ) / 2;     
+                    ii = -(row1[2*i*td+j+1] - row1[(2*i+1)*td+j+1] ) / 2;
+                }
+
+                dur = - g_delay * dw / 2 + j * dw / 2;
+
+                arg1 = (start_c + i*(end_c-start_c)/tot_points) * dur * 2 * M_PI;
+                c1   = cos(arg1);/*direct*/
+                s1   = sin(arg1);/*direct*/
+
+                crr  = c1*rr - s1*ri;
+                cri  = s1*rr + c1*ri;
+                cir  = c1*ir - s1*ii;
+                cii  = s1*ir +c1*ii;  /*corrected direct dim*/
+
+                dur2 = in_f1*i;
+                arg2 = (start_c + i*(end_c-start_c)/tot_points)*dur2*2*M_PI*bf1/bf_dir;
+                if (fnmode1s == 1) {  /*QF acquisition mode (pseudo 2D data)*/
+                    arg2 == 0;  
+                }
+                c2   = cos(arg2); /*indirect*/
+                s2   = sin(arg2); /*indirect*/
+
+                rowo[2*i*td+j] = c2*crr - s2*cir;
+                rowo[2*i*td+j+1] = c2*cri - s2*cii;
+                rowo[(2*i+1)*td+j] = s2*crr + c2*cir;
+                rowo[(2*i+1)*td+j+1] = s2*cri + c2*cii; /*corrected indirect as well*/               
+            }
+        }
+        fwrite(rowo, sizeof(int), td * td1, fpout);
+        if (fnmode1s == 6) {                   /* status parameter changed to States processing for Echo-Antiecho data to make write out uniform*/
+           	DATASET(name, nexpno, 1, disk, user)
+            STOREPARNS(1,"FnMODE", 4)
+        }
+        /*end of 2D correction*/
+
+    } else if (parmode == 2 ) {  /***3D data***/
+        if (aqseq == 1){  /**3D case with aqseq of 312**/
+            tot_points = td1s / 2 * td2s / 2;
+            row1 = (int*)malloc(td * td1s * td2s * sizeof(int));
+            rowo = (int*)malloc(td * td1s * td2s * sizeof(int));
+            fread(row1, sizeof(int), td * td1s * td2s, fpin);
+            for (j = 0; j < td2s / 2; j++) {  /*indirect dim loop1, slow*/
+                for (k = 0; k < td1s / 2; k++) {  /*indirect dim loop1, fast*/
+                    for (l = 0; l < td; l += 2) {  /*direct dim loop*/
+                        int rrr, rri, rir, rii, irr, iri, iir, iii;
+                        double arg1, arg2, arg3, c1, s1, c2, s2, c3, s3, crrr,crri,crir,crii,cirr, ciri, ciir, ciii;
+                        double ccrrr,ccrri,ccrir,ccrii,ccirr, cciri, cciir, cciii;
+                        rrr = row1[2*j*td1s*td + 2*k*td + l];
+                        rri = row1[2*j*td1s*td + 2*k*td + l+1];
+                        rir = row1[2*j*td1s*td + (2*k+1)*td + l];
+                        rii = row1[2*j*td1s*td + (2*k+1)*td + l+1];
+                        irr = row1[(2*j+1)*td1s*td + 2*k*td + l];
+                        iri = row1[(2*j+1)*td1s*td + 2*k*td + l+1];
+                        iir = row1[(2*j+1)*td1s*td + (2*k+1)*td + l];
+                        iii = row1[(2*j+1)*td1s*td + (2*k+1)*td + l+1];
+
+                        dur = - g_delay * dw / 2 + l * dw / 2;
+
+                        arg1 = (start_c + (td1s / 2 * j + k )*(end_c-start_c)/tot_points) * dur * 2 * M_PI;
+                        c1   = cos(arg1);/*direct part*/
+                        s1   = sin(arg1);/*direct part*/
+
+                        crrr  = c1*rrr - s1*rri;
+                        crri  = s1*rrr + c1*rri;
+                        crir  = c1*rir - s1*rii;
+                        crii  = s1*rir + c1*rii;
+
+                        cirr  = c1*irr - s1*iri;
+                        ciri  = s1*irr + c1*iri;
+                        ciir  = c1*iir - s1*iii;
+                        ciii  = s1*iir + c1*iii;  /*corrected direct dim*/
+
+                        dur2 = in_f1*k;   /*fast indirect dim*/
+                        arg2 = (start_c + (td1s / 2 * j + k )*(end_c-start_c)/tot_points)*dur2*2*M_PI*bf1/bf_dir;
+                        if (fnmode1s == 1) { /*QF acquisition mode (pseudo 3D data)*/
+                            arg2 = 0;
+                        }
+                        c2   = cos(arg2);
+                        s2   = sin(arg2);
+
+                        ccrrr  = c2*crrr - s2*crir;
+                        ccrri  = c2*crri - s2*crii;
+                        ccrir  = s2*crrr + c2*crir;
+                        ccrii  = s2*crri + c2*crii;
+
+                        ccirr  = c2*cirr - s2*ciir;
+                        cciri  = c2*ciri - s2*ciii;
+                        cciir  = s2*cirr + c2*ciir;
+                        cciii  = s2*ciri + c2*ciii; /*corrected indirect dim 1*/
+
+
+                        dur3 = in_f2*j;   /*slow indirect dim.  elapsed time is the same: (td2s / 2 * j + k)*/
+                        arg3 = (start_c + (td1s / 2 * j + k )*(end_c-start_c)/tot_points)*dur3*2*M_PI*bf2/bf_dir;
+                        if (fnmode2s == 1) {  /*QF acquisition mode (pseudo 3D data)*/
+                            arg3 = 0;
+                        }
+                        c3   = cos(arg3);
+                        s3   = sin(arg3);
+
+                          rowo[2*j*td1s*td + 2*k*td + l] = c3*ccrrr - s3*ccirr ;
+                        rowo[2*j*td1s*td + 2*k*td + l+1]= c3*ccrri - s3*cciri;
+                        rowo[2*j*td1s*td + (2*k+1)*td + l]= c3*ccrir - s3*cciir;
+                        rowo[2*j*td1s*td + (2*k+1)*td + l+1]= c3*ccrii - s3*cciii;
+
+                        rowo[(2*j+1)*td1s*td + 2*k*td + l]= s3*ccrrr +c3*ccirr;
+                        rowo[(2*j+1)*td1s*td + 2*k*td + l+1]=s3*ccrri +c3*cciri;
+                        rowo[(2*j+1)*td1s*td + (2*k+1)*td + l]=s3*ccrir +c3*cciir;
+                        rowo[(2*j+1)*td1s*td + (2*k+1)*td + l+1]=s3*ccrii +c3*cciii;
+                        /*corrected indirect dim2*/
+                    }
+                }
+            }
+            fwrite(rowo, sizeof(int), td * td1s * td2s, fpout);
+
+        } else if (aqseq == 0 ) {  /**3D data, aqsec of 321**/
+            tot_points = td1s / 2 * td2s / 2;
+
+            row1 = (int*)malloc(td * td1s * td2s * sizeof(int));
+            rowo = (int*)malloc(td * td1s * td2s * sizeof(int));
+            fread(row1, sizeof(int), td * td1s * td2s, fpin);
+
+             for (j = 0; j < td1s / 2; j++) { /*indirect dim loop1,slow*/
+                for (k = 0; k < td2s / 2; k++) { /*indirect dim loop1,fast*/
+                    for (l = 0; l < td; l += 2) { /*direct dim loop*/
+                        int rrr, rri, rir, rii, irr, iri, iir, iii;
+                        double arg1, arg2, arg3, c1, s1, c2, s2, c3, s3, crrr,crri,crir,crii,cirr, ciri, ciir, ciii;
+                        double ccrrr,ccrri,ccrir,ccrii,ccirr, cciri, cciir, cciii;
+                        rrr = row1[2*j*td2s*td + 2*k*td + l];
+                        rri = row1[2*j*td2s*td + 2*k*td + l+1];
+                        rir = row1[2*j*td2s*td + (2*k+1)*td + l];
+                        rii = row1[2*j*td2s*td + (2*k+1)*td + l+1];
+                        irr = row1[(2*j+1)*td2s*td + 2*k*td + l];
+                        iri = row1[(2*j+1)*td2s*td + 2*k*td + l+1];
+                        iir = row1[(2*j+1)*td2s*td + (2*k+1)*td + l];
+                        iii = row1[(2*j+1)*td2s*td + (2*k+1)*td + l+1];
+
+                        dur = - g_delay * dw / 2 + l * dw / 2;
+
+                        arg1 = (start_c + (td2s / 2 * j + k )*(end_c-start_c)/tot_points) * dur * 2 * M_PI;
+                        c1   = cos(arg1); /*direct part*/
+                        s1   = sin(arg1); /*direct part*/
+
+                        crrr  = c1*rrr - s1*rri;
+                        crri  = s1*rrr + c1*rri;
+                        crir  = c1*rir - s1*rii;
+                        crii  = s1*rir + c1*rii;
+
+                        cirr  = c1*irr - s1*iri;
+                        ciri  = s1*irr + c1*iri;
+                        ciir  = c1*iir - s1*iii;
+                        ciii  = s1*iir + c1*iii;  /*corrected direct dim*/
+
+                        dur2 = in_f2*k;   /*fast indirect dim*/
+                        arg2 = (start_c + (td2s / 2 * j + k )*(end_c-start_c)/tot_points)*dur2*2*M_PI*bf2/bf_dir;
+                        if (fnmode2s == 1) {  /*QF acquisition mode (pseudo 3D data)*/
+                            arg2 = 0;
+                        }
+                        c2   = cos(arg2);
+                        s2   = sin(arg2);
+
+
+                        ccrrr  = c2*crrr - s2*crir;
+                        ccrri  = c2*crri - s2*crii;
+                        ccrir  = s2*crrr + c2*crir;
+                        ccrii  = s2*crri + c2*crii;
+
+                        ccirr  = c2*cirr - s2*ciir;
+                        cciri  = c2*ciri - s2*ciii;
+                        cciir  = s2*cirr + c2*ciir;
+                        cciii  = s2*ciri + c2*ciii; /*corrected indirect dim 1*/
+
+
+                        dur3 = in_f1*j;   /*slow indirect dim. elapsed time is the same: (td2s / 2 * j + k)*/
+                        arg3 = (start_c + (td2s / 2 * j + k )*(end_c-start_c)/tot_points)*dur3*2*M_PI*bf1/bf_dir;
+                        if (fnmode1s == 1) {  /*QF acquisition mode (pseudo 3D data)*/
+                            arg3 =0;
+                        }
+                        c3   = cos(arg3);
+                        s3   = sin(arg3);
+
+                        rowo[2*j*td2s*td + 2*k*td + l] = c3*ccrrr - s3*ccirr ;
+                        rowo[2*j*td2s*td + 2*k*td + l+1]= c3*ccrri - s3*cciri;
+                        rowo[2*j*td2s*td + (2*k+1)*td + l]= c3*ccrir - s3*cciir;
+                        rowo[2*j*td2s*td + (2*k+1)*td + l+1]= c3*ccrii - s3*cciii;
+
+                        rowo[(2*j+1)*td2s*td + 2*k*td + l]= s3*ccrrr +c3*ccirr;
+                        rowo[(2*j+1)*td2s*td + 2*k*td + l+1]=s3*ccrri +c3*cciri;
+                        rowo[(2*j+1)*td2s*td + (2*k+1)*td + l]=s3*ccrir +c3*cciir;
+                        rowo[(2*j+1)*td2s*td + (2*k+1)*td + l+1]=s3*ccrii +c3*cciii;
+                     }
+                 }
+             }
+            fwrite(rowo, sizeof(int), td * td1s * td2s, fpout);
+        }
+        /*end parmode == 2, 3D case*/
+
+    } else if (parmode == 3 ) {  /***4D case with planes acquisition, aqseq of 4321 (only possible option)***/
+        tot_points = td1s / 2 * td2s / 2 * td3s / 2;
+
+        for (i = 0; i < td1s / 2; i++) {  /*read in 2 x 3D sized blocks to avoid running out of memory*/
+            row1 = (int*)malloc(td * td3s * td2s * 2 * sizeof(int)); /* replace td1 with td3*/
+            if (row1 == 0)
+                STOPMSG("cannot get enough memory")
+            rowo = (int*)malloc(td * td3s * td2s * 2 * sizeof(int));
+            if (rowo == 0)
+                STOPMSG("cannot get enough memory")
+            fread(row1, sizeof(int), td * td3s * td2s * 2, fpin);
+
+            for (j = 0; j < td2s / 2; j++) {  /*indirect dim loop1,slow*/
+                for (k = 0; k < td3s / 2; k++) {  /*indirect dim loop1,fast*/
+                    for (l = 0; l < td; l += 2) {  /*direct dim loop*/
+                        int rrrr, rrri, rrir, rrii, rirr, riri, riir, riii, irrr, irri, irir, irii, iirr, iiri, iiir, iiii;
+                        double crrrr, crrri, crrir, crrii, crirr, criri, criir, criii, cirrr, cirri, cirir, cirii, ciirr, ciiri, ciiir, ciiii;
+                        double ccrrrr, ccrrri, ccrrir, ccrrii, ccrirr, ccriri, ccriir, ccriii, ccirrr, ccirri, ccirir, ccirii, cciirr, cciiri, cciiir, cciiii;
+                        double cccrrrr, cccrrri, cccrrir, cccrrii, cccrirr, cccriri, cccriir, cccriii, cccirrr, cccirri, cccirir, cccirii, ccciirr, ccciiri, ccciiir, ccciiii;
+                        double arg1, arg2, arg3, arg4, c1, s1, c2, s2, c3, s3, c4, s4;
+
+                        /*remove i, since now reading in blocks of data*/
+                        rrrr = row1[2*j*td3s*td + 2*k*td + l];
+                        rrri = row1[2*j*td3s*td + 2*k*td + l+1];
+                        rrir = row1[2*j*td3s*td + (2*k+1)*td + l];
+                        rrii = row1[2*j*td3s*td + (2*k+1)*td + l+1];
+
+                        rirr = row1[(2*j+1)*td3s*td + 2*k*td + l];
+                        riri = row1[(2*j+1)*td3s*td + 2*k*td + l+1];
+                        riir = row1[(2*j+1)*td3s*td + (2*k+1)*td + l];
+                        riii = row1[(2*j+1)*td3s*td + (2*k+1)*td + l+1];
+
+                        irrr = row1[td2s*td3s*td + 2*j*td3s*td + 2*k*td + l];
+                        irri = row1[td2s*td3s*td + 2*j*td3s*td + 2*k*td + l+1];
+                        irir = row1[td2s*td3s*td + 2*j*td3s*td + (2*k+1)*td + l];
+                        irii = row1[td2s*td3s*td + 2*j*td3s*td + (2*k+1)*td + l+1];
+
+                        iirr = row1[td2s*td3s*td + (2*j+1)*td3s*td + 2*k*td + l];
+                        iiri = row1[td2s*td3s*td + (2*j+1)*td3s*td + 2*k*td + l+1];
+                        iiir = row1[td2s*td3s*td + (2*j+1)*td3s*td + (2*k+1)*td + l];
+                        iiii = row1[td2s*td3s*td + (2*j+1)*td3s*td + (2*k+1)*td + l+1];
+
+                        dur = - g_delay * dw / 2 + l * dw / 2;
+
+                        arg1 = (start_c + (td2s / 2 * td3s / 2 * i + td3s / 2 * j + k )*(end_c-start_c)/tot_points) * dur * 2 * M_PI;
+                        c1   = cos(arg1);/*direct part*/
+                        s1   = sin(arg1);/*direct part*/
+
+                        crrrr  = c1*rrrr - s1*rrri;
+                        crrri  = s1*rrrr + c1*rrri;
+                        crrir  = c1*rrir - s1*rrii;
+                        crrii  = s1*rrir + c1*rrii;
+
+                        crirr  = c1*rirr - s1*riri;
+                        criri  = s1*rirr + c1*riri;
+                        criir  = c1*riir - s1*riii;
+                        criii  = s1*riir + c1*riii;
+
+                        cirrr  = c1*irrr - s1*irri;
+                        cirri  = s1*irrr + c1*irri;
+                        cirir  = c1*irir - s1*irii;
+                        cirii  = s1*irir + c1*irii;
+
+                        ciirr  = c1*iirr - s1*iiri;
+                        ciiri  = s1*iirr + c1*iiri;
+                        ciiir  = c1*iiir - s1*iiii;
+                        ciiii  = s1*iiir + c1*iiii; /*corrected direct dim*/
+
+                        dur2 = in_f3*k;   /*fast indirect dim*/
+                        arg2 = (start_c + (td2s / 2 * td3s / 2 * i + td3s / 2 * j + k )*(end_c-start_c)/tot_points)*dur2*2*M_PI*bf3/bf_dir;
+                        if (fnmode3s == 1) {  /*QF acquisition mode (pseudo 4D data)*/
+                            arg2 = 0;
+                        }
+                        c2   = cos(arg2);
+                        s2   = sin(arg2);
+
+
+                        ccrrrr  = c2*crrrr - s2*crrir;
+                        ccrrri  = c2*crrri - s2*crrii;
+                        ccrrir  = s2*crrrr + c2*crrir;
+                        ccrrii  = s2*crrri + c2*crrii;
+
+                        ccrirr  = c2*crirr - s2*criir;
+                        ccriri  = c2*criri - s2*criii;
+                        ccriir  = s2*crirr + c2*criir;
+                        ccriii  = s2*criri + c2*criii;
+
+                        ccirrr  = c2*cirrr - s2*cirir;
+                        ccirri  = c2*cirri - s2*cirii;
+                        ccirir  = s2*cirrr + c2*cirir;
+                        ccirii  = s2*cirri + c2*cirii;
+
+                        cciirr  = c2*ciirr - s2*ciiir;
+                        cciiri  = c2*ciiri - s2*ciiii;
+                        cciiir  = s2*ciirr + c2*ciiir;
+                        cciiii  = s2*ciiri + c2*ciiii; /*corrected indirect dim 1*/
+
+
+                        dur3 = in_f2*j;   /*next slowest indirect dim.  elapsed time is the same: (td2s / 2 * td1s / 2 * i + td1s / 2 * j + k )*/
+                        arg3 = (start_c + (td2s / 2 * td3s / 2 * i + td3s / 2 * j + k )*(end_c-start_c)/tot_points)*dur3*2*M_PI*bf2/bf_dir;
+                        if (fnmode2s == 1) {  /*QF acquisition mode (pseudo 4D data)*/
+                            arg3 = 0;
+                        }
+                        c3   = cos(arg3);
+                        s3   = sin(arg3);
+
+
+                        cccrrrr = c3*ccrrrr - s3*ccrirr;
+                        cccrrri = c3*ccrrri - s3*ccriri;
+                        cccrrir = c3*ccrrir - s3*ccriir;
+                        cccrrii = c3*ccrrii - s3*ccriii;
+
+                        cccrirr  = s3*ccrrrr +c3*ccrirr;
+                        cccriri  = s3*ccrrri +c3*ccriri;
+                        cccriir  = s3*ccrrir +c3*ccriir;
+                        cccriii  = s3*ccrrii +c3*ccriii;
+
+                        cccirrr  = c3*ccirrr - s3*cciirr;
+                        cccirri  = c3*ccirri - s3*cciiri;
+                        cccirir  = c3*ccirir - s3*cciiir;
+                        cccirii  = c3*ccirii - s3*cciiii;
+
+                        ccciirr  = s3*ccirrr +c3*cciirr;
+                        ccciiri  = s3*ccirri +c3*cciiri;
+                        ccciiir  = s3*ccirir +c3*cciiir;
+                        ccciiii  = s3*ccirii +c3*cciiii;
+
+                        /*slowest dim*/
+                        dur4 = in_f1*i;   /*  elapsed time is the same */
+                        arg4 = (start_c + (td2s / 2 * td3s / 2 * i + td3s / 2 * j + k )*(end_c-start_c)/tot_points)*dur4*2*M_PI*bf1/bf_dir;
+                        if (fnmode1s == 1) {  /*QF acquisition mode (pseudo 4D data)*/
+                            arg4 = 0;
+                        }
+                        c4   = cos(arg4);
+                        s4   = sin(arg4);
+
+
+                        /*remove i, since reading blocks of data*/
+                        rowo[ 2*j*td3s*td + 2*k*td + l] = c4*cccrrrr - s4*cccirrr ; /*rrrr*/
+                        rowo[2*j*td3s*td + 2*k*td + l+1]= c4*cccrrri - s4*cccirri; /*rrri*/
+                        rowo[2*j*td3s*td + (2*k+1)*td + l]= c4*cccrrir - s4*cccirir; /*rrir*/
+                        rowo[2*j*td3s*td + (2*k+1)*td + l+1]= c4*cccrrii - s4*cccirii; /*rrii*/
+
+                        rowo[(2*j+1)*td3s*td + 2*k*td + l]= c4*cccrirr - s4*ccciirr; /*rirr*/
+                        rowo[(2*j+1)*td3s*td + 2*k*td + l+1]=c4*cccriri - s4*ccciiri;/*riri*/
+                        rowo[(2*j+1)*td3s*td + (2*k+1)*td + l]=c4*cccriir - s4*ccciiir; /*riir*/
+                        rowo[(2*j+1)*td3s*td + (2*k+1)*td + l+1]=c4*cccriii - s4*ccciiii;/*riii*/
+
+                        rowo[td2s*td3s*td + 2*j*td3s*td + 2*k*td + l] = s4*cccrrrr + c4*cccirrr; /*irrr*/
+                        rowo[td2s*td3s*td + 2*j*td3s*td + 2*k*td + l+1]= s4*cccrrri + c4*cccirri; /*irri*/
+                        rowo[td2s*td3s*td + 2*j*td3s*td + (2*k+1)*td + l]= s4*cccrrir + c4*cccirir; /*irir*/
+                        rowo[td2s*td3s*td + 2*j*td3s*td + (2*k+1)*td + l+1]= s4*cccrrii + c4*cccirii; /*irii*/
+
+                        rowo[td2s*td3s*td + (2*j+1)*td3s*td + 2*k*td + l]= s4*cccrirr + c4*ccciirr; /*iirr*/
+                        rowo[td2s*td3s*td + (2*j+1)*td3s*td + 2*k*td + l+1]=s4*cccriri + c4*ccciiri; /*iiri*/
+                        rowo[td2s*td3s*td + (2*j+1)*td3s*td + (2*k+1)*td + l]=s4*cccriir + c4*ccciiir;  /*iiir*/
+                        rowo[td2s*td3s*td + (2*j+1)*td3s*td + (2*k+1)*td + l+1]=s4*cccriii + c4*ccciiii; /*iiii*/
+                    }
+                }
+            }
+            fwrite(rowo, sizeof(int), td * td3s * td2s * 2, fpout);
+            free(row1);
+            free(rowo);
+        }
+    }  
+/*end for data recorded in planes*/
+} else if ( fntype==2 ) {  /****NUS DATA****/
+    if (parmode == 2 ) {  /***3D data***/
+        if (aqseq == 1) {  /**3D case with aqseq of 312, not used in Topspin 3.5, always recorded as aqseq = 321**/
+            tot_points = nus_points * 4;
+
+            row1 = (int*)malloc( td * 4* nus_points * sizeof(int));
+            rowo = (int*)malloc( td * 4* nus_points * sizeof(int));
+            fread(row1, sizeof(int), td *4* nus_points, fpin);
+
+            for (j = 0; j < nus_points * 4; j+=4) {  /*indirct dim loop1,slow*/
+                fscanf(fp, "%d %d", &cur_pointf2, &cur_pointf1); /*read in NUS file*/
+        
+                for (l = 0; l < td; l += 2) {  /*direct dim loop*/
+                    int rrr, rri, rir, rii, irr, iri, iir, iii;
+                    double arg1, arg2, arg3, c1, s1, c2, s2, c3, s3, crrr,crri,crir,crii,cirr, ciri, ciir, ciii;
+                    double ccrrr,ccrri,ccrir,ccrii,ccirr, cciri, cciir, cciii;
+                    rrr = row1[j*td + l];
+                    rri = row1[j*td + l+1];
+                    rir = row1[(j+1)*td + l];
+                    rii = row1[(j+1)*td + l+1];
+                    irr = row1[(j+2)*td + l];
+                    iri = row1[(j+2)*td + l+1];
+                    iir = row1[(j+3)*td + l];
+                    iii = row1[(j+3)*td + l+1];
+
+                    dur = - g_delay * dw / 2 + l * dw / 2;
+
+                    arg1 = (start_c + j * (end_c-start_c)/tot_points) * dur * 2 * M_PI;
+                    c1   = cos(arg1);/*direct part*/
+                    s1   = sin(arg1);/*direct part*/
+
+                    crrr  = c1*rrr - s1*rri;
+                    crri  = s1*rrr + c1*rri;
+                    crir  = c1*rir - s1*rii;
+                    crii  = s1*rir + c1*rii;
+
+                    cirr  = c1*irr - s1*iri;
+                    ciri  = s1*irr + c1*iri;
+                    ciir  = c1*iir - s1*iii;
+                    ciii  = s1*iir + c1*iii;  /*corrected direct dim*/
+
+                    dur2 = in_f1*cur_pointf1;   /*fast indirect dim*/
+                    arg2 = (start_c + j * (end_c-start_c)/tot_points)*dur2*2*M_PI*bf1/bf_dir;
+                    c2   = cos(arg2);
+                    s2   = sin(arg2);
+
+
+                    ccrrr  = c2*crrr - s2*crir;
+                    ccrri  = c2*crri - s2*crii;
+                    ccrir  = s2*crrr + c2*crir;
+                    ccrii  = s2*crri + c2*crii;
+
+                    ccirr  = c2*cirr - s2*ciir;
+                    cciri  = c2*ciri - s2*ciii;
+                    cciir  = s2*cirr + c2*ciir;
+                    cciii  = s2*ciri + c2*ciii; /*corrected indirect dim 1*/
+
+
+                    dur3 = in_f2*cur_pointf2;   /*slow indirect dim.  elapsed time is the same: (td2s / 2 * j + k)*/
+                    arg3 = (start_c + j * (end_c-start_c)/tot_points)*dur3*2*M_PI*bf2/bf_dir;
+                    c3   = cos(arg3);
+                    s3   = sin(arg3);
+
+                    rowo[j*td + l] = c3*ccrrr - s3*ccirr ;
+                    rowo[j*td + l + 1]= c3*ccrri - s3*cciri;
+                    rowo[(j+1)*td + l]= c3*ccrir - s3*cciir;
+                    rowo[(j+1)*td + l + 1]= c3*ccrii - s3*cciii;
+
+                    rowo[(j+2)*td + l]= s3*ccrrr +c3*ccirr;
+                    rowo[(j+2)*td + l + 1]= s3*ccrri +c3*cciri;
+                    rowo[(j+3)*td + l]= s3*ccrir +c3*cciir;
+                    rowo[(j+3)*td + l + 1]= s3*ccrii +c3*cciii;
+                    /*corrected indirect as well*/
+                }
+            }
+            fwrite(rowo, sizeof(int), td * nus_points * 4, fpout);
+            free(row1);
+            free(rowo);
+        } else if (aqseq == 0) {  /**3D case with aqseq of 321**/
+
+            tot_points = nus_points * 4;
+
+            row1 = (int*)malloc( td * 4* nus_points * sizeof(int));
+            rowo = (int*)malloc( td * 4* nus_points * sizeof(int));
+            fread(row1, sizeof(int), td *4* nus_points, fpin);
+
+            for (j = 0; j < nus_points * 4; j+=4) {  /*indirect dim loop1,slow*/ 	 	   
+                fscanf(fp, "%d %d", &cur_pointf2, &cur_pointf1); /*read in NUS file*/
+        
+                for (l = 0; l < td; l += 2) {  /*direct dim loop*/
+                    int rrr, rri, rir, rii, irr, iri, iir, iii;
+                    double arg1, arg2, arg3, c1, s1, c2, s2, c3, s3, crrr,crri,crir,crii,cirr, ciri, ciir, ciii;
+                    double ccrrr,ccrri,ccrir,ccrii,ccirr, cciri, cciir, cciii;
+                    rrr = row1[j*td + l];
+                    rri = row1[j*td + l+1];
+                    rir = row1[(j+1)*td + l];
+                    rii = row1[(j+1)*td + l+1];
+                    irr = row1[(j+2)*td + l];
+                    iri = row1[(j+2)*td + l+1];
+                    iir = row1[(j+3)*td + l];
+                    iii = row1[(j+3)*td + l+1];
+
+                    dur = - g_delay * dw / 2 + l * dw / 2;
+
+                    arg1 = (start_c + j * (end_c-start_c)/tot_points) * dur * 2 * M_PI;
+                    c1   = cos(arg1);/*direct part*/
+                    s1   = sin(arg1);/*direct part*/
+
+                    crrr  = c1*rrr - s1*rri;
+                    crri  = s1*rrr + c1*rri;
+                    crir  = c1*rir - s1*rii;
+                    crii  = s1*rir + c1*rii;
+
+                    cirr  = c1*irr - s1*iri;
+                    ciri  = s1*irr + c1*iri;
+                    ciir  = c1*iir - s1*iii;
+                    ciii  = s1*iir + c1*iii;  /*corrected direct dim*/
+
+                    dur2 = in_f2*cur_pointf2;   /*fast indirect dim*/
+                    arg2 = (start_c + j * (end_c-start_c)/tot_points)*dur2*2*M_PI*bf2/bf_dir;
+                    c2   = cos(arg2);
+                    s2   = sin(arg2);
+
+
+                    ccrrr  = c2*crrr - s2*crir;
+                    ccrri  = c2*crri - s2*crii;
+                    ccrir  = s2*crrr + c2*crir;
+                    ccrii  = s2*crri + c2*crii;
+
+                    ccirr  = c2*cirr - s2*ciir;
+                    cciri  = c2*ciri - s2*ciii;
+                    cciir  = s2*cirr + c2*ciir;
+                    cciii  = s2*ciri + c2*ciii; /*corrected indirect dim 1*/
+
+
+                    dur3 = in_f1*cur_pointf1;   /*slow indirect dim.  elapsed time is the same: (td2s / 2 * j + k)*/
+                    arg3 = (start_c + j * (end_c-start_c)/tot_points)*dur3*2*M_PI*bf1/bf_dir;
+                    c3   = cos(arg3);
+                    s3   = sin(arg3);
+
+                    rowo[j*td + l] = c3*ccrrr - s3*ccirr ;
+                    rowo[j*td + l + 1]= c3*ccrri - s3*cciri;
+                    rowo[(j+1)*td + l]= c3*ccrir - s3*cciir;
+                    rowo[(j+1)*td + l + 1]= c3*ccrii - s3*cciii;
+
+                    rowo[(j+2)*td + l]= s3*ccrrr +c3*ccirr;
+                    rowo[(j+2)*td + l + 1]= s3*ccrri +c3*cciri;
+                    rowo[(j+3)*td + l]= s3*ccrir +c3*cciir;
+                    rowo[(j+3)*td + l + 1]= s3*ccrii +c3*cciii;
+                    /*corrected indirect as well*/
+                }   
+            }
+            fwrite(rowo, sizeof(int), td * nus_points * 4, fpout);
+            free(row1);
+            free(rowo);
+        }
+    } else if (parmode == 3 ) {  /***4D NUS case, aqseq of 4321***/
+
+        tot_points = nus_points * 8;
+
+        row1 = (int*)malloc(td * nus_points * 8 * sizeof(int)); 
+        if (row1 == 0)
+            STOPMSG("cannot get enough memory")
+        rowo = (int*)malloc(td * nus_points * 8 * sizeof(int));
+        if (rowo == 0)
+            STOPMSG("cannot get enough memory")
+        fread(row1, sizeof(int), td * nus_points * 8, fpin);
+        
+        for (j = 0; j < nus_points * 8; j+=8) {  
+            fscanf(fp, "%d %d %d", &cur_pointf3, &cur_pointf2, &cur_pointf1); /*read in NUS file*/
+            for (l = 0; l < td; l += 2) {  /*direct dim loop*/
+                int rrrr, rrri, rrir, rrii, rirr, riri, riir, riii, irrr, irri, irir, irii, iirr, iiri, iiir, iiii;
+                double crrrr, crrri, crrir, crrii, crirr, criri, criir, criii, cirrr, cirri, cirir, cirii, ciirr, ciiri, ciiir, ciiii;
+                double ccrrrr, ccrrri, ccrrir, ccrrii, ccrirr, ccriri, ccriir, ccriii, ccirrr, ccirri, ccirir, ccirii, cciirr, cciiri, cciiir, cciiii;
+                double cccrrrr, cccrrri, cccrrir, cccrrii, cccrirr, cccriri, cccriir, cccriii, cccirrr, cccirri, cccirir, cccirii, ccciirr, ccciiri, ccciiir, ccciiii;
+                double arg1, arg2, arg3, arg4, c1, s1, c2, s2, c3, s3, c4, s4;
+
+                /*remove i, since now reading in blocks of data*/
+                rrrr = row1[j*td + l];
+                rrri = row1[j*td + l+1];
+                rrir = row1[(j+1)*td + l];
+                rrii = row1[(j+1)*td + l+1];
+
+                rirr = row1[(j+2)*td + l];
+                riri = row1[(j+2)*td + l+1];
+                riir = row1[(j+3)*td + l];
+                riii = row1[(j+3)*td + l+1];
+
+                irrr = row1[(j+4)*td + l];
+                irri = row1[(j+4)*td + l+1];
+                irir = row1[(j+5)*td + l];
+                irii = row1[(j+5)*td + l+1];
+
+                iirr = row1[(j+6)*td + l];
+                iiri = row1[(j+6)*td + l+1];
+                iiir = row1[(j+7)*td + l];
+                iiii = row1[(j+7)*td + l+1];
+
+                dur = - g_delay * dw / 2 + l * dw / 2;
+
+                arg1 = (start_c + j*(end_c-start_c)/tot_points) * dur * 2 * M_PI;
+                c1   = cos(arg1);  /*direct*/
+                s1   = sin(arg1);  /*direct*/
+
+                crrrr  = c1*rrrr - s1*rrri;
+                crrri  = s1*rrrr + c1*rrri;
+                crrir  = c1*rrir - s1*rrii;
+                crrii  = s1*rrir + c1*rrii;
+
+                crirr  = c1*rirr - s1*riri;
+                criri  = s1*rirr + c1*riri;
+                criir  = c1*riir - s1*riii;
+                criii  = s1*riir + c1*riii;
+
+                cirrr  = c1*irrr - s1*irri;
+                cirri  = s1*irrr + c1*irri;
+                cirir  = c1*irir - s1*irii;
+                cirii  = s1*irir + c1*irii;
+
+                ciirr  = c1*iirr - s1*iiri;
+                ciiri  = s1*iirr + c1*iiri;
+                ciiir  = c1*iiir - s1*iiii;
+                ciiii  = s1*iiir + c1*iiii; /*corrected direct dimension*/
+
+                dur2 = in_f3*cur_pointf3;   
+                arg2 = (start_c + j*(end_c-start_c)/tot_points)*dur2*2*M_PI*bf3/bf_dir;
+                c2   = cos(arg2);
+                s2   = sin(arg2);
+
+
+                ccrrrr  = c2*crrrr - s2*crrir;
+                ccrrri  = c2*crrri - s2*crrii;
+                ccrrir  = s2*crrrr + c2*crrir;
+                ccrrii  = s2*crrri + c2*crrii;
+
+                ccrirr  = c2*crirr - s2*criir;
+                ccriri  = c2*criri - s2*criii;
+                ccriir  = s2*crirr + c2*criir;
+                ccriii  = s2*criri + c2*criii;
+
+                ccirrr  = c2*cirrr - s2*cirir;
+                ccirri  = c2*cirri - s2*cirii;
+                ccirir  = s2*cirrr + c2*cirir;
+                ccirii  = s2*cirri + c2*cirii;
+
+                cciirr  = c2*ciirr - s2*ciiir;
+                cciiri  = c2*ciiri - s2*ciiii;
+                cciiir  = s2*ciirr + c2*ciiir;
+                cciiii  = s2*ciiri + c2*ciiii;  /*corrected indirect dim3*/
+
+
+                dur3 = in_f2*cur_pointf2;   
+                arg3 = (start_c + j*(end_c-start_c)/tot_points)*dur3*2*M_PI*bf2/bf_dir;
+                c3   = cos(arg3);
+                s3   = sin(arg3);
+
+
+                cccrrrr = c3*ccrrrr - s3*ccrirr;
+                cccrrri = c3*ccrrri - s3*ccriri;
+                cccrrir = c3*ccrrir - s3*ccriir;
+                cccrrii = c3*ccrrii - s3*ccriii;
+
+                cccrirr  = s3*ccrrrr +c3*ccrirr;
+                cccriri  = s3*ccrrri +c3*ccriri;
+                cccriir  = s3*ccrrir +c3*ccriir;
+                cccriii  = s3*ccrrii +c3*ccriii;
+
+                cccirrr  = c3*ccirrr - s3*cciirr;
+                cccirri  = c3*ccirri - s3*cciiri;
+                cccirir  = c3*ccirir - s3*cciiir;
+                cccirii  = c3*ccirii - s3*cciiii;
+
+                ccciirr  = s3*ccirrr +c3*cciirr;
+                ccciiri  = s3*ccirri +c3*cciiri;
+                ccciiir  = s3*ccirir +c3*cciiir;
+                ccciiii  = s3*ccirii +c3*cciiii;  /*corrected indirect dim2*/
+
+                /*slowest dim*/
+                dur4 = in_f1*cur_pointf1;   /*elapsed time is the same*/
+                arg4 = (start_c + j*(end_c-start_c)/tot_points)*dur4*2*M_PI*bf1/bf_dir;
+                c4   = cos(arg4);
+                s4   = sin(arg4);
+
+                rowo[j*td + l] = c4*cccrrrr - s4*cccirrr ; /*rrrr*/
+                rowo[j*td + l+1]= c4*cccrrri - s4*cccirri; /*rrri*/
+                rowo[(j+1)*td + l]= c4*cccrrir - s4*cccirir; /*rrir*/
+                rowo[(j+1)*td + l+1]= c4*cccrrii - s4*cccirii; /*rrii*/
+
+                rowo[(j+2)*td + l]= c4*cccrirr - s4*ccciirr; /*rirr*/
+                rowo[(j+2)*td + l+1]=c4*cccriri - s4*ccciiri;/*riri*/
+                rowo[(j+3)*td + l]=c4*cccriir - s4*ccciiir; /*riir*/
+                rowo[(j+3)*td + l+1]=c4*cccriii - s4*ccciiii;/*riii*/
+
+                rowo[(j+4)*td + l] = s4*cccrrrr + c4*cccirrr; /*irrr*/
+                rowo[(j+4)*td + l+1]= s4*cccrrri + c4*cccirri; /*irri*/
+                rowo[(j+5)*td + l]= s4*cccrrir + c4*cccirir; /*irir*/
+                rowo[(j+5)*td + l+1]= s4*cccrrii + c4*cccirii; /*irii*/
+
+                rowo[(j+6)*td + l]= s4*cccrirr + c4*ccciirr; /*iirr*/
+                rowo[(j+6)*td + l+1]= s4*cccriri + c4*ccciiri; /*iiri*/
+                rowo[(j+7)*td + l]= s4*cccriir + c4*ccciiir;  /*iiir*/
+                rowo[(j+7)*td + l+1]= s4*cccriii + c4*ccciiii; /*iiii*/  /*corrected indirect dim1*/
+            }
+        }
+        fwrite(rowo, sizeof(int), td * nus_points * 8, fpout);
+        free(row1);
+        free(rowo);
+    }
+
+} else if ( fntype==1 ) {  /****DATA RECORDED IN POINTS****/
+    if (parmode == 2 ) {  /***3D data***/
+        if (aqseq == 0) {  /**aqseq of 321**/
+      
+            tot_points = td1s / 2 * td2s / 2 ;  /*number of complex points*/
+        
+            int rrr, rri, rir, rii, irr, iri, iir, iii;
+            double arg1, arg2, arg3, c1, s1, c2, s2, c3, s3, crrr,crri,crir,crii,cirr, ciri, ciir, ciii;
+            double ccrrr,ccrri,ccrir,ccrii,ccirr, cciri, cciir, cciii;  
+        
+            row1 = (int*)malloc( td * 4 * sizeof(int));
+            rowo = (int*)malloc( td * 4 * sizeof(int));
+     
+            for (j = 0; j < td1s /2; j++) {
+                for (k = 0; k < td2s / 2; k++) { 
+                    fread(row1, sizeof(int), td *4, fpin);
+                    for (l = 0; l < td; l += 2) {
+        
+                        rrr = row1[l];
+                        rri = row1[l+1];
+                        rir = row1[td + l];
+                        rii = row1[td + l+1];
+                        irr = row1[2*td + l];
+                        iri = row1[2*td + l+1];
+                        iir = row1[3*td + l];
+                        iii = row1[3*td + l+1];
+
+                        dur = - g_delay * dw / 2 + l * dw / 2;
+
+                        arg1 = (start_c + j * (end_c-start_c)/tot_points) * dur * 2 * M_PI;
+                        c1   = cos(arg1);/*direct*/
+                        s1   = sin(arg1);/*direct*/
+
+                        crrr  = c1*rrr - s1*rri;
+                        crri  = s1*rrr + c1*rri;
+                        crir  = c1*rir - s1*rii;
+                        crii  = s1*rir + c1*rii;
+
+                        cirr  = c1*irr - s1*iri;
+                        ciri  = s1*irr + c1*iri;
+                        ciir  = c1*iir - s1*iii;
+                        ciii  = s1*iir + c1*iii;  /*corrected direct dim*/
+
+
+                        dur2 = in_f2*k;   /*fast indirect dim*/
+                        arg2 = (start_c + (td2s / 2 * j + k ) * (end_c-start_c)/tot_points)*dur2*2*M_PI*bf2/bf_dir;
+                        if (fnmode2s == 1) {  /*QF acquisition mode (pseudo 3D data)*/
+                            arg2 = 0;
+                        }
+                        c2   = cos(arg2);
+                        s2   = sin(arg2);
+
+                        ccrrr  = c2*crrr - s2*crir;
+                        ccrri  = c2*crri - s2*crii;
+                        ccrir  = s2*crrr + c2*crir;
+                        ccrii  = s2*crri + c2*crii;
+
+                        ccirr  = c2*cirr - s2*ciir;
+                        cciri  = c2*ciri - s2*ciii;
+                        cciir  = s2*cirr + c2*ciir;
+                        cciii  = s2*ciri + c2*ciii;  /*corrected fast indirect dim*/
+        
+        
+                        dur3 = in_f1*j;   /*slow indirect dim.  elapsed time is the same: (td2s / 2 * j + k)*/
+                        arg3 = (start_c + (td2s / 2 * j + k )*(end_c-start_c)/tot_points)*dur3*2*M_PI*bf1/bf_dir;
+                        if (fnmode1s == 1) {  /*QF acquisition mode (pseudo 3D data)*/
+                            arg3 = 0;
+                        }
+                        c3   = cos(arg3);
+                        s3   = sin(arg3);
+
+                        rowo[l] = c3*ccrrr - s3*ccirr ;
+                        rowo[l+1]= c3*ccrri - s3*cciri;
+                        rowo[td + l]= c3*ccrir - s3*cciir;
+                        rowo[td + l+1]= c3*ccrii - s3*cciii;
+
+                        rowo[2*td + l]= s3*ccrrr +c3*ccirr;
+                        rowo[2*td + l+1]= s3*ccrri +c3*cciri;
+                        rowo[3*td + l]= s3*ccrir +c3*cciir;
+                        rowo[3*td + l+1]= s3*ccrii +c3*cciii;  /*corrected slow indirect dim*/
+                    }
+                    fwrite(rowo, sizeof(int), td *4, fpout);
+                }
+            }
+            free(row1);
+            free(rowo);
+        }
+        
+        if (aqseq == 1) {  /**aqseq of 312**/
+      
+            tot_points = td1s / 2 * td2s / 2 ;  /*number of complex points*/
+
+            int rrr, rri, rir, rii, irr, iri, iir, iii;
+            double arg1, arg2, arg3, c1, s1, c2, s2, c3, s3, crrr,crri,crir,crii,cirr, ciri, ciir, ciii;
+            double ccrrr,ccrri,ccrir,ccrii,ccirr, cciri, cciir, cciii;  
+
+            row1 = (int*)malloc( td * 4 * sizeof(int));
+            rowo = (int*)malloc( td * 4 * sizeof(int));
+     
+            for (j = 0; j < td2s /2; j++) {
+                for (k = 0; k < td1s / 2; k++) { 
+                    fread(row1, sizeof(int), td *4, fpin);
+                    for (l = 0; l < td; l += 2) {
+                
+                        rrr = row1[l];
+                        rri = row1[l+1];
+                        rir = row1[td + l];
+                        rii = row1[td + l+1];
+                        irr = row1[2*td + l];
+                        iri = row1[2*td + l+1];
+                        iir = row1[3*td + l];
+                        iii = row1[3*td + l+1];
+        
+                        dur = - g_delay * dw / 2 + l * dw / 2;
+
+                        arg1 = (start_c + j * (end_c-start_c)/tot_points) * dur * 2 * M_PI;
+                        c1   = cos(arg1);/*direct*/
+                        s1   = sin(arg1);/*direct*/
+
+                        crrr  = c1*rrr - s1*rri;
+                        crri  = s1*rrr + c1*rri;
+                        crir  = c1*rir - s1*rii;
+                        crii  = s1*rir + c1*rii;
+
+                        cirr  = c1*irr - s1*iri;
+                        ciri  = s1*irr + c1*iri;
+                        ciir  = c1*iir - s1*iii;
+                        ciii  = s1*iir + c1*iii;  /*corrected direct dim*/
+        
+        
+                        dur2 = in_f1*k;   /*fast indirect dim*/
+                        arg2 = (start_c + (td1s / 2 * j + k ) * (end_c-start_c)/tot_points)*dur2*2*M_PI*bf1/bf_dir;
+                        if (fnmode1s == 1) {  /*QF acquisition mode (pseudo 3D data)*/
+                            arg2 = 0;
+                        }
+                        c2   = cos(arg2);
+                        s2   = sin(arg2);
+
+                        ccrrr  = c2*crrr - s2*crir;
+                        ccrri  = c2*crri - s2*crii;
+                        ccrir  = s2*crrr + c2*crir;
+                        ccrii  = s2*crri + c2*crii;
+
+                        ccirr  = c2*cirr - s2*ciir;
+                        cciri  = c2*ciri - s2*ciii;
+                        cciir  = s2*cirr + c2*ciir;
+                        cciii  = s2*ciri + c2*ciii; /*corrected indirect dim 1*/
+
+
+                        dur3 = in_f2*j;   /*slow indirect dim. elapsed time is the same: (td2s / 2 * j + k)*/
+                        arg3 = (start_c + (td1s / 2 * j + k )*(end_c-start_c)/tot_points)*dur3*2*M_PI*bf2/bf_dir;
+                        if (fnmode2s == 1) {  /*QF acquisition mode (pseudo 3D data)*/
+                            arg3 = 0;
+                        }
+                        c3   = cos(arg3);
+                        s3   = sin(arg3);
+
+                        rowo[l] = c3*ccrrr - s3*ccirr ;
+                        rowo[l+1]= c3*ccrri - s3*cciri;
+                        rowo[td + l]= c3*ccrir - s3*cciir;
+                        rowo[td + l+1]= c3*ccrii - s3*cciii;
+
+                        rowo[2*td + l]= s3*ccrrr +c3*ccirr;
+                        rowo[2*td + l+1]= s3*ccrri +c3*cciri;
+                        rowo[3*td + l]= s3*ccrir +c3*cciir;
+                        rowo[3*td + l+1]= s3*ccrii +c3*cciii;
+                    }
+                    fwrite(rowo, sizeof(int), td * 4, fpout);
+                }
+            }
+            free(row1);
+            free(rowo);
+        }
+        
+    } else if (parmode == 3 ) {  /***4D case with points acquisition, aqseq of 4321***/
+
+        tot_points = td1s / 2 * td2s / 2 * td3s / 2;
+         
+        row1 = (int*)malloc(td * 8 * sizeof(int)); 
+        rowo = (int*)malloc(td * 8 * sizeof(int));
+
+        for (i = 0; i < td1s / 2; i++) {
+            for (j = 0; j < td2s / 2; j++) {  /*indirect dim loop1,slow*/
+                for (k = 0; k < td3s / 2; k++) {  /*indirect dim loop1,fast*/
+                    /*read in 8 FIDs*/
+                    fread(row1, sizeof(int), td * 8, fpin);
+                    for (l = 0; l < td; l += 2) {  /*direct dim loop*/
+                        int rrrr, rrri, rrir, rrii, rirr, riri, riir, riii, irrr, irri, irir, irii, iirr, iiri, iiir, iiii;
+                        double crrrr, crrri, crrir, crrii, crirr, criri, criir, criii, cirrr, cirri, cirir, cirii, ciirr, ciiri, ciiir, ciiii;
+                        double ccrrrr, ccrrri, ccrrir, ccrrii, ccrirr, ccriri, ccriir, ccriii, ccirrr, ccirri, ccirir, ccirii, cciirr, cciiri, cciiir, cciiii;
+                        double cccrrrr, cccrrri, cccrrir, cccrrii, cccrirr, cccriri, cccriir, cccriii, cccirrr, cccirri, cccirir, cccirii, ccciirr, ccciiri, ccciiir, ccciiii;
+                        double arg1, arg2, arg3, arg4, c1, s1, c2, s2, c3, s3, c4, s4;
+
+                        rrrr = row1[l];
+                        rrri = row1[l+1];
+                        rrir = row1[td + l];
+                        rrii = row1[td + l+1];
+
+                        rirr = row1[2*td + l];
+                        riri = row1[2*td + l+1];
+                        riir = row1[3*td + l];
+                        riii = row1[3*td + l+1];
+
+                        irrr = row1[4*td + l];
+                        irri = row1[4*td + l+1];
+                        irir = row1[5*td + l];
+                        irii = row1[5*td + l+1];
+
+                        iirr = row1[6*td + l];
+                        iiri = row1[6*td + l+1];
+                        iiir = row1[7*td + l];
+                        iiii = row1[7*td + l+1];
+
+                        dur = - g_delay * dw / 2 + l * dw / 2;
+
+                        arg1 = (start_c + (td2s / 2 * td3s / 2 * i + td3s / 2 * j + k )*(end_c-start_c)/tot_points) * dur * 2 * M_PI;
+                        c1   = cos(arg1);/*direct*/
+                        s1   = sin(arg1);/*direct*/
+
+                        crrrr  = c1*rrrr - s1*rrri;
+                        crrri  = s1*rrrr + c1*rrri;
+                        crrir  = c1*rrir - s1*rrii;
+                        crrii  = s1*rrir + c1*rrii;
+
+                        crirr  = c1*rirr - s1*riri;
+                        criri  = s1*rirr + c1*riri;
+                        criir  = c1*riir - s1*riii;
+                        criii  = s1*riir + c1*riii;
+
+                        cirrr  = c1*irrr - s1*irri;
+                        cirri  = s1*irrr + c1*irri;
+                        cirir  = c1*irir - s1*irii;
+                        cirii  = s1*irir + c1*irii;
+
+                        ciirr  = c1*iirr - s1*iiri;
+                        ciiri  = s1*iirr + c1*iiri;
+                        ciiir  = c1*iiir - s1*iiii;
+                        ciiii  = s1*iiir + c1*iiii; /*corrected direct dim*/
+
+                        dur2 = in_f3*k;   /*fast indirect dim*/
+                        arg2 = (start_c + (td2s / 2 * td3s / 2 * i + td3s / 2 * j + k )*(end_c-start_c)/tot_points)*dur2*2*M_PI*bf3/bf_dir;
+                        if (fnmode3s == 1) {  /*QF acquisition mode (pseudo 4D data)*/
+                            arg2 = 0;
+                        }
+                        c2   = cos(arg2);
+                        s2   = sin(arg2);
+
+
+                        ccrrrr  = c2*crrrr - s2*crrir;
+                        ccrrri  = c2*crrri - s2*crrii;
+                        ccrrir  = s2*crrrr + c2*crrir;
+                        ccrrii  = s2*crrri + c2*crrii;
+
+                        ccrirr  = c2*crirr - s2*criir;
+                        ccriri  = c2*criri - s2*criii;
+                        ccriir  = s2*crirr + c2*criir;
+                        ccriii  = s2*criri + c2*criii;
+
+                        ccirrr  = c2*cirrr - s2*cirir;
+                        ccirri  = c2*cirri - s2*cirii;
+                        ccirir  = s2*cirrr + c2*cirir;
+                        ccirii  = s2*cirri + c2*cirii;
+
+                        cciirr  = c2*ciirr - s2*ciiir;
+                        cciiri  = c2*ciiri - s2*ciiii;
+                        cciiir  = s2*ciirr + c2*ciiir;
+                        cciiii  = s2*ciiri + c2*ciiii; /*corrected fast indirect dim*/
+
+
+                        dur3 = in_f2*j;   /*next slowest indirect dim.  elapsed time is the same: (td2s / 2 * td1s / 2 * i + td1s / 2 * j + k )*/
+                        arg3 = (start_c + (td2s / 2 * td3s / 2 * i + td3s / 2 * j + k )*(end_c-start_c)/tot_points)*dur3*2*M_PI*bf2/bf_dir;
+                        if (fnmode2s == 1) {  /*QF acquisition mode (pseudo 4D data)*/
+                            arg3 = 0;
+                        }
+                        c3   = cos(arg3);
+                        s3   = sin(arg3);
+
+
+                        cccrrrr = c3*ccrrrr - s3*ccrirr;
+                        cccrrri = c3*ccrrri - s3*ccriri;
+                        cccrrir = c3*ccrrir - s3*ccriir;
+                        cccrrii = c3*ccrrii - s3*ccriii;
+
+                        cccrirr  = s3*ccrrrr +c3*ccrirr;
+                        cccriri  = s3*ccrrri +c3*ccriri;
+                        cccriir  = s3*ccrrir +c3*ccriir;
+                        cccriii  = s3*ccrrii +c3*ccriii;
+
+                        cccirrr  = c3*ccirrr - s3*cciirr;
+                        cccirri  = c3*ccirri - s3*cciiri;
+                        cccirir  = c3*ccirir - s3*cciiir;
+                        cccirii  = c3*ccirii - s3*cciiii;
+
+                        ccciirr  = s3*ccirrr +c3*cciirr;
+                        ccciiri  = s3*ccirri +c3*cciiri;
+                        ccciiir  = s3*ccirir +c3*cciiir;
+                        ccciiii  = s3*ccirii +c3*cciiii;  /*corrected next slowest indirect dim*/
+
+                        /*slowest indirect dim*/
+                        dur4 = in_f1*i;   /*  elapsed time is the same */
+                        arg4 = (start_c + (td2s / 2 * td3s / 2 * i + td3s / 2 * j + k )*(end_c-start_c)/tot_points)*dur4*2*M_PI*bf1/bf_dir;
+                        if (fnmode1s == 1) {  /*QF acquisition mode (pseudo 4D data)*/
+                            arg4 = 0;
+                        }
+                        c4   = cos(arg4);
+                        s4   = sin(arg4);
+
+
+                        /*remove i, since reading blocks of data*/
+                        rowo[l] = c4*cccrrrr - s4*cccirrr ; /*rrrr*/
+                        rowo[l+1]= c4*cccrrri - s4*cccirri; /*rrri*/
+                        rowo[td + l]= c4*cccrrir - s4*cccirir; /*rrir*/
+                        rowo[td + l+1]= c4*cccrrii - s4*cccirii; /*rrii*/
+
+                        rowo[2*td + l]= c4*cccrirr - s4*ccciirr; /*rirr*/
+                        rowo[2*td + l+1]= c4*cccriri - s4*ccciiri;/*riri*/
+                        rowo[3*td + l]= c4*cccriir - s4*ccciiir; /*riir*/
+                        rowo[3*td + l+1]= c4*cccriii - s4*ccciiii;/*riii*/
+
+                        rowo[4*td + l] = s4*cccrrrr + c4*cccirrr; /*irrr*/
+                        rowo[4*td + l+1]= s4*cccrrri + c4*cccirri; /*irri*/
+                        rowo[5*td + l]= s4*cccrrir + c4*cccirir; /*irir*/
+                        rowo[5*td + l+1]= s4*cccrrii + c4*cccirii; /*irii*/
+
+                        rowo[6*td + l]= s4*cccrirr + c4*ccciirr; /*iirr*/
+                        rowo[6*td + l+1]=s4*cccriri + c4*ccciiri; /*iiri*/
+                        rowo[7*td + l]=s4*cccriir + c4*ccciiir;  /*iiir*/
+                        rowo[7*td + l+1]=s4*cccriii + c4*ccciiii; /*iiii*/  /* corrected slowest indirect dim*/
+                              
+                    }
+                    fwrite(rowo, sizeof(int), td * 8, fpout);
+                }
+            }
+        }
+        free(row1);
+        free(rowo);
+    }
+}
+ 
+fclose(fpin);
+fclose(fpout);
+ 
+if ( fntype==2 ) {  /*close NUS file if NUS data*/
+    fclose(fp);
+}
+
+Show_status("done");
+
+REFRESHDATA
+QUIT
